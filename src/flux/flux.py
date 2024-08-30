@@ -14,8 +14,7 @@ from einops import rearrange, repeat
 
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file as load_sft
-from transformers import (CLIPTextModel, CLIPTokenizer, T5EncoderModel,
-                          T5Tokenizer)
+from transformers import (CLIPTextModel, CLIPTokenizer, T5EncoderModel)
 
 from torch import Tensor, nn
 
@@ -298,9 +297,24 @@ class LastLayer(nn.Module):
 
 
 ##Conditioner########################################################################################################
+from sentencepiece import SentencePieceProcessor
+
+class T5TokenizerMine:
+    def __init__(self):
+        self.spp = SentencePieceProcessor(model_file="/root/.cache/huggingface/hub/models--google--t5-v1_1-xxl/snapshots/3db67ab1af984cf10548a73467f0e5bca2aaaeb2" + "/spiece.model")
+
+    def __call__(self, text, max_length, *args, **kwargs):
+        if isinstance(text, str):
+            text = [text]
+        encoded = self.spp.Encode(text)
+        ret = torch.zeros((len(encoded), max_length), dtype=torch.int)
+        for i, row in enumerate(encoded):
+            ret[i, :len(row) + 1] = torch.tensor(row + [1])
+        return {"input_ids":ret}
 
 class HFEmbedder(nn.Module):
     def __init__(self, version: str, max_length: int, **hf_kwargs):
+        print(f"{version=}")
         super().__init__()
         self.is_clip = version.startswith("openai")
         self.max_length = max_length
@@ -310,12 +324,14 @@ class HFEmbedder(nn.Module):
             self.tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(version, max_length=max_length)
             self.hf_module: CLIPTextModel = CLIPTextModel.from_pretrained(version, **hf_kwargs)
         else:
-            self.tokenizer: T5Tokenizer = T5Tokenizer.from_pretrained(version, max_length=max_length)
+            self.tokenizer = T5TokenizerMine()
             self.hf_module: T5EncoderModel = T5EncoderModel.from_pretrained(version, **hf_kwargs)
 
         self.hf_module = self.hf_module.eval().requires_grad_(False)
 
     def forward(self, text: list[str]) -> Tensor:
+        # if isinstance(self.tokenizer, T5Tokenizer):
+        #     return torch.tensor(self.tokenizer(text), device=self.device)
         batch_encoding = self.tokenizer(
             text,
             truncation=True,
@@ -325,6 +341,9 @@ class HFEmbedder(nn.Module):
             padding="max_length",
             return_tensors="pt",
         )
+        # if not self.is_clip:
+        #     print(batch_encoding)
+        #     print(self.my_tokenizer(text))
 
         outputs = self.hf_module(
             input_ids=batch_encoding["input_ids"].to(self.hf_module.device),
