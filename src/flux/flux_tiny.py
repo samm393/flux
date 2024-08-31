@@ -10,31 +10,32 @@ import argparse
 import math
 from typing import Callable
 
-from einops import rearrange, repeat
-
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file as load_sft
-from transformers import (CLIPTextModel, CLIPTokenizer, T5EncoderModel)
 
-from torch import Tensor, nn
+from tinygrad import Tensor, nn, dtypes
+from tinygrad.nn.state import torch_load
 
 ##math###############################################################################################################
 def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
     q, k = apply_rope(q, k, pe)
 
-    x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-    x = rearrange(x, "B H L D -> B L (H D)")
+    x = Tensor.scaled_dot_product_attention(q, k, v)
+    x = x.rearrange("B H L D -> B L (H D)")
 
     return x
 
 
 def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
     assert dim % 2 == 0
-    scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
+    scale = Tensor.arange(0, dim, 2, dtype=dtypes.float64, device=pos.device) / dim
     omega = 1.0 / (theta**scale)
-    out = torch.einsum("...n,d->...nd", pos, omega)
-    out = torch.stack([torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1)
-    out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
+    ##out = Tensor.einsum("...n,d->...nd", pos, omega) ##not suported in tinygrad
+    out = pos.unsqueeze(-1) * omega.unsqueeze(0)
+
+
+    out = Tensor.stack([Tensor.cos(out), -Tensor.sin(out), Tensor.sin(out), Tensor.cos(out)], dim=-1)
+    out = out.rearrange("b n d (i j) -> b n d i j", i=2, j=2)
     return out.float()
 
 
@@ -57,7 +58,7 @@ class EmbedND():
 
     def __call__(self, ids: Tensor) -> Tensor:
         n_axes = ids.shape[-1]
-        emb = torch.cat(
+        emb = Tensor.cat(
             [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
             dim=-3,
         )
@@ -76,15 +77,15 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
     """
     t = time_factor * t
     half = dim // 2
-    freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
+    freqs = Tensor.exp(-math.log(max_period) * Tensor.arange(start=0, end=half, dtype=dtypes.float32) / half).to(
         t.device
     )
 
     args = t[:, None].float() * freqs[None]
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    embedding = Tensor.cat([Tensor.cos(args), Tensor.sin(args)], dim=-1)
     if dim % 2:
-        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-    if torch.is_floating_point(t):
+        embedding = Tensor.cat([embedding, Tensor.zeros_like(embedding[:, :1])], dim=-1)
+    if Tensor.is_floating_point(t):
         embedding = embedding.to(t)
     return embedding
 
@@ -103,12 +104,12 @@ class MLPEmbedder():
 class RMSNorm():
     def __init__(self, dim: int):
         
-        self.scale = nn.Parameter(torch.ones(dim))
+        self.scale = Tensor.ones(dim)
 
     def __call__(self, x: Tensor):
         x_dtype = x.dtype
         x = x.float()
-        rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
+        rrms = Tensor.rsqrt(Tensor.mean(x**2, dim=-1, keepdim=True) + 1e-6)
         return (x * rrms).cast(dtype=x_dtype) * self.scale
 
 
@@ -136,7 +137,7 @@ class SelfAttention():
 
     def __call__(self, x: Tensor, pe: Tensor) -> Tensor:
         qkv = self.qkv(x)
-        q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        q, k, v = qkv.rearrange("B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         q, k = self.norm(q, k, v)
         x = attention(q, k, v, pe=pe)
         x = self.proj(x)
@@ -203,20 +204,20 @@ class DoubleStreamBlock():
         img_modulated = self.img_norm1(img)
         img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
         img_qkv = self.img_attn.qkv(img_modulated)
-        img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        img_q, img_k, img_v = img_qkv.rearrange("B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
 
         # prepare txt for attention
         txt_modulated = self.txt_norm1(txt)
         txt_modulated = (1 + txt_mod1.scale) * txt_modulated + txt_mod1.shift
         txt_qkv = self.txt_attn.qkv(txt_modulated)
-        txt_q, txt_k, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        txt_q, txt_k, txt_v = txt_qkv.rearrange("B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
 
         # run actual attention
-        q = torch.cat((txt_q, img_q), dim=2)
-        k = torch.cat((txt_k, img_k), dim=2)
-        v = torch.cat((txt_v, img_v), dim=2)
+        q = Tensor.cat((txt_q, img_q), dim=2)
+        k = Tensor.cat((txt_k, img_k), dim=2)
+        v = Tensor.cat((txt_v, img_v), dim=2)
 
         attn = attention(q, k, v, pe=pe)
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
@@ -267,15 +268,15 @@ class SingleStreamBlock():
     def __call__(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
         mod, _ = self.modulation(vec)
         x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
-        qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
+        qkv, mlp = Tensor.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
 
-        q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        q, k, v = qkv.rearrange("B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         q, k = self.norm(q, k, v)
 
         # compute attention
         attn = attention(q, k, v, pe=pe)
         # compute activation in mlp stream, cat again and run second linear layer
-        output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        output = self.linear2(Tensor.cat((attn, self.mlp_act(mlp)), 2))
         return x + mod.gate * output
 
 
@@ -307,50 +308,50 @@ class T5TokenizerMine:
         if isinstance(text, str):
             text = [text]
         encoded = self.spp.Encode(text)
-        ret = torch.zeros((len(encoded), max_length), dtype=torch.int)
+        ret = Tensor.zeros((len(encoded), max_length), dtype=dtypes.int)
         for i, row in enumerate(encoded):
-            ret[i, :len(row) + 1] = torch.tensor(row + [1])
+            ret[i, :len(row) + 1] = Tensor(row + [1])
         return {"input_ids":ret}
 
-class HFEmbedder():
-    def __init__(self, version: str, max_length: int, **hf_kwargs):
-        print(f"{version=}")
+# class HFEmbedder():
+#     def __init__(self, version: str, max_length: int, **hf_kwargs):
+#         print(f"{version=}")
         
-        self.is_clip = version.startswith("openai")
-        self.max_length = max_length
-        self.output_key = "pooler_output" if self.is_clip else "last_hidden_state"
+#         self.is_clip = version.startswith("openai")
+#         self.max_length = max_length
+#         self.output_key = "pooler_output" if self.is_clip else "last_hidden_state"
 
-        if self.is_clip:
-            self.tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(version, max_length=max_length)
-            self.hf_module: CLIPTextModel = CLIPTextModel.from_pretrained(version, **hf_kwargs)
-        else:
-            self.tokenizer = T5TokenizerMine()
-            self.hf_module: T5EncoderModel = T5EncoderModel.from_pretrained(version, **hf_kwargs)
+#         if self.is_clip:
+#             self.tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(version, max_length=max_length)
+#             self.hf_module: CLIPTextModel = CLIPTextModel.from_pretrained(version, **hf_kwargs)
+#         else:
+#             self.tokenizer = T5TokenizerMine()
+#             self.hf_module: T5EncoderModel = T5EncoderModel.from_pretrained(version, **hf_kwargs)
 
-        self.hf_module = self.hf_module.eval().requires_grad_(False)
+#         self.hf_module = self.hf_module.eval().requires_grad_(False)
 
-    def __call__(self, text: list[str]) -> Tensor:
-        # if isinstance(self.tokenizer, T5Tokenizer):
-        #     return torch.tensor(self.tokenizer(text), device=self.device)
-        batch_encoding = self.tokenizer(
-            text,
-            truncation=True,
-            max_length=self.max_length,
-            return_length=False,
-            return_overflowing_tokens=False,
-            padding="max_length",
-            return_tensors="pt",
-        )
-        # if not self.is_clip:
-        #     print(batch_encoding)
-        #     print(self.my_tokenizer(text))
+#     def __call__(self, text: list[str]) -> Tensor:
+#         # if isinstance(self.tokenizer, T5Tokenizer):
+#         #     return torch.tensor(self.tokenizer(text), device=self.device)
+#         batch_encoding = self.tokenizer(
+#             text,
+#             truncation=True,
+#             max_length=self.max_length,
+#             return_length=False,
+#             return_overflowing_tokens=False,
+#             padding="max_length",
+#             return_tensors="pt",
+#         )
+#         # if not self.is_clip:
+#         #     print(batch_encoding)
+#         #     print(self.my_tokenizer(text))
 
-        outputs = self.hf_module(
-            input_ids=batch_encoding["input_ids"].to(self.hf_module.device),
-            attention_mask=None,
-            output_hidden_states=False,
-        )
-        return outputs[self.output_key]
+#         outputs = self.hf_module(
+#             input_ids=batch_encoding["input_ids"].to(self.hf_module.device),
+#             attention_mask=None,
+#             output_hidden_states=False,
+#         )
+#         return outputs[self.output_key]
 
 from t5 import T5EncoderModel
 from t5 import T5Config
@@ -427,7 +428,7 @@ class AutoEncoderParams:
 
 
 def swish(x: Tensor) -> Tensor:
-    return x * torch.sigmoid(x)
+    return x * Tensor.sigmoid(x)
 
 
 class AttnBlock():
@@ -449,12 +450,12 @@ class AttnBlock():
         v = self.v(h_)
 
         b, c, h, w = q.shape
-        q = rearrange(q, "b c h w -> b 1 (h w) c").contiguous()
-        k = rearrange(k, "b c h w -> b 1 (h w) c").contiguous()
-        v = rearrange(v, "b c h w -> b 1 (h w) c").contiguous()
+        q = q.rearrange("b c h w -> b 1 (h w) c").contiguous()
+        k = k.rearrange("b c h w -> b 1 (h w) c").contiguous()
+        v = v.rearrange("b c h w -> b 1 (h w) c").contiguous()
         h_ = nn.functional.scaled_dot_product_attention(q, k, v)
 
-        return rearrange(h_, "b 1 (h w) c -> b c h w", h=h, w=w, c=c, b=b)
+        return h_.rearrange("b 1 (h w) c -> b c h w", h=h, w=w, c=c, b=b)
 
     def __call__(self, x: Tensor) -> Tensor:
         return x + self.proj_out(self.attention(x))
@@ -674,10 +675,10 @@ class DiagonalGaussian():
         self.chunk_dim = chunk_dim
 
     def __call__(self, z: Tensor) -> Tensor:
-        mean, logvar = torch.chunk(z, 2, dim=self.chunk_dim)
+        mean, logvar = Tensor.chunk(z, 2, dim=self.chunk_dim)
         if self.sample:
-            std = torch.exp(0.5 * logvar)
-            return mean + std * torch.randn_like(mean)
+            std = Tensor.exp(0.5 * logvar)
+            return mean + std * Tensor.randn_like(mean)
         else:
             return mean
 
@@ -813,13 +814,13 @@ class Model:
             vec = vec + self.vector_in(y)
             txt = self.txt_in(txt)
 
-            ids = torch.cat((txt_ids, img_ids), dim=1)
+            ids = Tensor.cat((txt_ids, img_ids), dim=1)
             pe = self.pe_embedder(ids)
 
             for block in self.double_blocks:
                 img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
 
-            img = torch.cat((txt, img), 1)
+            img = Tensor.cat((txt, img), 1)
             for block in self.single_blocks:
                 img = block(img, vec=vec, pe=pe)
             img = img[:, txt.shape[1] :, ...]
@@ -959,12 +960,12 @@ class Util:
         return model
 
 
-    def load_t5(device: str | torch.device = "cuda", max_length: int = 512) -> HFEmbedder:
+    def load_t5(device: str | torch.device = "cuda", max_length: int = 512):
         # max length 64, 128, 256 and 512 should work (if your sequence is short enough)
         return T5Embedder()
 
 
-    def load_clip(device: str | torch.device = "cuda") -> HFEmbedder:
+    def load_clip(device: str | torch.device = "cuda"):
         return ClipEmbedder()
 
 
@@ -1013,30 +1014,35 @@ class Sampling:
         )
 
 
-    def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, prompt: str | list[str]) -> dict[str, Tensor]:
+    def prepare(t5, clip, img: Tensor, prompt: str | list[str]) -> dict[str, Tensor]:
         bs, c, h, w = img.shape
         if bs == 1 and not isinstance(prompt, str):
             bs = len(prompt)
 
-        img = rearrange(img, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+        img = img.rearrange("b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
         if img.shape[0] == 1 and bs > 1:
-            img = repeat(img, "1 ... -> bs ...", bs=bs)
+            ##img = repeat(img, "1 ... -> bs ...", bs=bs) ## not supported
+            img = img.expand((bs, *img.shape[1:]))
 
-        img_ids = torch.zeros(h // 2, w // 2, 3)
-        img_ids[..., 1] = img_ids[..., 1] + torch.arange(h // 2)[:, None]
-        img_ids[..., 2] = img_ids[..., 2] + torch.arange(w // 2)[None, :]
-        img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs)
+        img_ids = Tensor.zeros(h // 2, w // 2, 3)
+        img_ids[..., 1] = img_ids[..., 1] + Tensor.arange(h // 2)[:, None]
+        img_ids[..., 2] = img_ids[..., 2] + Tensor.arange(w // 2)[None, :]
+        ##img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs) ##not supported
+        img_ids = img_ids.rearrange("h w c -> 1 (h w) c")
+        img_ids = img_ids.expand((bs, *img_ids.shape[1:]))
 
         if isinstance(prompt, str):
             prompt = [prompt]
         txt = t5(prompt)
         if txt.shape[0] == 1 and bs > 1:
-            txt = repeat(txt, "1 ... -> bs ...", bs=bs)
-        txt_ids = torch.zeros(bs, txt.shape[1], 3)
+            ##txt = repeat(txt, "1 ... -> bs ...", bs=bs)
+            txt = txt.expand((bs, *txt.shape[1:]))
+        txt_ids = Tensor.zeros(bs, txt.shape[1], 3)
 
         vec = clip(prompt)
         if vec.shape[0] == 1 and bs > 1:
-            vec = repeat(vec, "1 ... -> bs ...", bs=bs)
+            ##vec = repeat(vec, "1 ... -> bs ...", bs=bs)
+            vec = vec.expand((bs, *vec.shape[1:]))
 
         return {
             "img": img,
@@ -1067,7 +1073,7 @@ class Sampling:
         shift: bool = True,
     ) -> list[float]:
         # extra step for zero
-        timesteps = torch.linspace(1, 0, num_steps + 1)
+        timesteps = Tensor.linspace(1, 0, num_steps + 1)
 
         # shifting the schedule to favor high timesteps for higher signal images
         if shift:
@@ -1091,9 +1097,9 @@ class Sampling:
         guidance: float = 4.0,
     ):
         # this is ignored for schnell
-        guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
+        guidance_vec = Tensor.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
         for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
-            t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+            t_vec = Tensor.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
             pred = model(
                 img=img,
                 img_ids=img_ids,
@@ -1110,8 +1116,7 @@ class Sampling:
 
 
     def unpack(x: Tensor, height: int, width: int) -> Tensor:
-        return rearrange(
-            x,
+        return x.rearrange(
             "b (h w) (c ph pw) -> b c (h ph) (w pw)",
             h=math.ceil(height / 16),
             w=math.ceil(width / 16),
@@ -1150,7 +1155,7 @@ if __name__ == "__main__":
         available = ", ".join(Util.configs.keys())
         raise ValueError(f"Got unknown model name: {args.name}, chose from {available}")
 
-    torch_device = torch.device(args.device)
+    torch_device = Tensor.device(args.device)
     if args.num_steps is None:
         num_steps = 4 if args.name == "flux-schnell" else 50
 
@@ -1169,7 +1174,7 @@ if __name__ == "__main__":
         else:
             idx = 0
 
-    with torch.inference_mode():
+    with Tensor.inference_mode():
         # init all components
         t5 = Util.load_t5(torch_device, max_length=256 if args.name == "flux-schnell" else 512)
         clip = Util.load_clip(torch_device)
@@ -1197,7 +1202,7 @@ if __name__ == "__main__":
             opts.height,
             opts.width,
             device=torch_device,
-            dtype=torch.bfloat16,
+            dtype=dtypes.bfloat16,
             seed=opts.seed,
         )
         opts.seed = None
@@ -1233,7 +1238,7 @@ if __name__ == "__main__":
     print(f"Done in {t1 - t0:.1f}s. Saving {fn}")
     # bring into PIL format and save
     x = x.clamp(-1, 1)
-    x = rearrange(x[0], "c h w -> h w c")
+    x = x[0].rearrange("c h w -> h w c")
 
     img = Image.fromarray((127.5 * (x + 1.0)).cpu().byte().numpy())
     
