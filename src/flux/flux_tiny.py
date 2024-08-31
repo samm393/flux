@@ -10,9 +10,6 @@ import argparse
 import math
 from typing import Callable
 
-from huggingface_hub import hf_hub_download
-from safetensors.torch import load_file as load_sft
-
 from tinygrad import Tensor, nn, dtypes
 from tinygrad.nn.state import torch_load
 
@@ -302,7 +299,7 @@ from sentencepiece import SentencePieceProcessor
 
 class T5TokenizerMine:
     def __init__(self):
-        self.spp = SentencePieceProcessor(model_file="/root/.cache/huggingface/hub/models--google--t5-v1_1-xxl/snapshots/3db67ab1af984cf10548a73467f0e5bca2aaaeb2" + "/spiece.model")
+        self.spp = SentencePieceProcessor(model_file="t5spiece.model")
 
     def __call__(self, text, max_length, *args, **kwargs):
         if isinstance(text, str):
@@ -357,32 +354,32 @@ from t5 import T5EncoderModel
 from t5 import T5Config
 
 class T5Embedder():
-    def __init__(self, version:str):
+    def __init__(self):
         self.tokenizer = T5TokenizerMine()
 
         config = T5Config(**{
-            "d_ff": 1024,
+            "d_ff": 10240,
             "d_kv": 64,
-            "d_model": 512,
+            "d_model": 4096,
             "layer_norm_epsilon": 1e-06,
-            "num_decoder_layers": 8,
-            "num_heads": 6,
-            "num_layers": 8,
+            "num_decoder_layers": 24,
+            "num_heads": 64,
+            "num_layers": 24,
             "relative_attention_num_buckets": 32,
             "vocab_size": 32128,
             })
 
         self.encoder = T5EncoderModel(config)
 
-        state_dict = nn.state.get_state_dict(model)
+        state_dict = nn.state.get_state_dict(self.encoder)
 
         for key in state_dict:
             state_dict[key].replace(state_dict[key].cast("bfloat16").realize())
 
-        load_state_dict = torch_load("small.bin")
+        load_state_dict = torch_load("t5.bin")
 
         for key in load_state_dict:
-            load_state_dict[key].replace(load_state_dict[key].to("NV").cast("bfloat16").realize())
+            load_state_dict[key].replace(load_state_dict[key].to("cuda").cast("bfloat16").realize())
 
         nn.state.load_state_dict(model, load_state_dict)
 
@@ -1155,7 +1152,7 @@ if __name__ == "__main__":
         available = ", ".join(Util.configs.keys())
         raise ValueError(f"Got unknown model name: {args.name}, chose from {available}")
 
-    torch_device = Tensor.device(args.device)
+    torch_device = args.device
     if args.num_steps is None:
         num_steps = 4 if args.name == "flux-schnell" else 50
 
@@ -1174,7 +1171,7 @@ if __name__ == "__main__":
         else:
             idx = 0
 
-    with Tensor.inference_mode():
+    with Tensor.test():
         # init all components
         t5 = Util.load_t5(torch_device, max_length=256 if args.name == "flux-schnell" else 512)
         clip = Util.load_clip(torch_device)
