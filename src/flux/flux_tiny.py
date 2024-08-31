@@ -12,6 +12,10 @@ from typing import Callable
 
 from tinygrad import Tensor, nn, dtypes
 from tinygrad.nn.state import torch_load
+from tinygrad.helpers import fetch
+
+def TensorIdentity(x:Tensor) -> Tensor:
+    return x
 
 ##math###############################################################################################################
 def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
@@ -91,11 +95,10 @@ class MLPEmbedder():
     def __init__(self, in_dim: int, hidden_dim: int):
         
         self.in_layer = nn.Linear(in_dim, hidden_dim, bias=True)
-        self.silu = nn.SiLU()
         self.out_layer = nn.Linear(hidden_dim, hidden_dim, bias=True)
 
     def __call__(self, x: Tensor) -> Tensor:
-        return self.out_layer(self.silu(self.in_layer(x)))
+        return self.out_layer(self.in_layer(x).silu())
 
 
 class RMSNorm():
@@ -176,22 +179,22 @@ class DoubleStreamBlock():
         self.img_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
 
         self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.img_mlp = nn.Sequential(
+        self.img_mlp = [
             nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
-            nn.GELU(approximate="tanh"),
+            Tensor.gelu,
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
-        )
+        ]
 
         self.txt_mod = Modulation(hidden_size, double=True)
         self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.txt_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
 
         self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.txt_mlp = nn.Sequential(
+        self.txt_mlp = [
             nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
-            nn.GELU(approximate="tanh"),
+            Tensor.gelu,
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
-        )
+        ]
 
     def __call__(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor) -> tuple[Tensor, Tensor]:
         img_mod1, img_mod2 = self.img_mod(vec)
@@ -221,11 +224,11 @@ class DoubleStreamBlock():
 
         # calculate the img bloks
         img = img + img_mod1.gate * self.img_attn.proj(img_attn)
-        img = img + img_mod2.gate * self.img_mlp((1 + img_mod2.scale) * self.img_norm2(img) + img_mod2.shift)
+        img = img + img_mod2.gate * ((1 + img_mod2.scale) * self.img_norm2(img) + img_mod2.shift).sequential(self.img_mlp)
 
         # calculate the txt bloks
         txt = txt + txt_mod1.gate * self.txt_attn.proj(txt_attn)
-        txt = txt + txt_mod2.gate * self.txt_mlp((1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift)
+        txt = txt + txt_mod2.gate * ((1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift).sequential(self.txt_mlp)
         return img, txt
 
 
@@ -259,7 +262,7 @@ class SingleStreamBlock():
         self.hidden_size = hidden_size
         self.pre_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
 
-        self.mlp_act = nn.GELU(approximate="tanh")
+        self.mlp_act = Tensor.gelu
         self.modulation = Modulation(hidden_size, double=False)
 
     def __call__(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
@@ -282,10 +285,10 @@ class LastLayer():
         
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
+        self.adaLN_modulation = [Tensor.silu, nn.Linear(hidden_size, 2 * hidden_size, bias=True)]
 
     def __call__(self, x: Tensor, vec: Tensor) -> Tensor:
-        shift, scale = self.adaLN_modulation(vec).chunk(2, dim=1)
+        shift, scale = vec.sequential(self.adaLN_modulation).chunk(2, dim=1)
         x = (1 + scale[:, None, :]) * self.norm_final(x) + shift[:, None, :]
         x = self.linear(x)
         return x
@@ -299,7 +302,8 @@ from sentencepiece import SentencePieceProcessor
 
 class T5TokenizerMine:
     def __init__(self):
-        self.spp = SentencePieceProcessor(model_file="t5spiece.model")
+        file_path = fetch("https://huggingface.co/google/t5-v1_1-xxl/resolve/main/spiece.model")
+        self.spp = SentencePieceProcessor(str(file_path))
 
     def __call__(self, text, max_length, *args, **kwargs):
         if isinstance(text, str):
@@ -350,8 +354,8 @@ class T5TokenizerMine:
 #         )
 #         return outputs[self.output_key]
 
-from t5 import T5EncoderModel
-from t5 import T5Config
+from t5tiny import T5EncoderModel
+from t5tiny import T5Config
 
 class T5Embedder():
     def __init__(self):
@@ -371,17 +375,19 @@ class T5Embedder():
 
         self.encoder = T5EncoderModel(config)
 
-        state_dict = nn.state.get_state_dict(self.encoder)
+        # state_dict = nn.state.get_state_dict(self.encoder)
 
-        for key in state_dict:
-            state_dict[key].replace(state_dict[key].cast("bfloat16").realize())
+        # for key in state_dict:
+        #     state_dict[key].replace(state_dict[key].cast("bfloat16").realize())
+        #     print(state_dict[key])
 
-        load_state_dict = torch_load("t5.bin")
+        print('hi')
+        load_state_dict = torch_load(fetch("https://huggingface.co/google/t5-v1_1-xxl/resolve/main/pytorch_model.bin"))
 
         for key in load_state_dict:
-            load_state_dict[key].replace(load_state_dict[key].to("cuda").cast("bfloat16").realize())
+            load_state_dict[key].replace(load_state_dict[key].to("clang").cast("float16").realize())
 
-        nn.state.load_state_dict(model, load_state_dict)
+        nn.state.load_state_dict(self.encoder, load_state_dict)
 
     def __call__(self, text:str):
         toks = self.tokenizer(text)
@@ -394,7 +400,7 @@ class ClipEmbedder():
     def __init__(self):
         self.tokenizer = Tokenizer.ClipTokenizer()
         self.encoder = Closed.ClipTextModel(None)
-        state_dict = nn.state.torch_load("clip.bin")
+        state_dict = torch_load(fetch("https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/pytorch_model.bin"))
 
         del state_dict["logit_scale"]
         del state_dict["text_model.embeddings.position_ids"]
@@ -765,7 +771,7 @@ class Model:
             self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size)
             self.vector_in = MLPEmbedder(params.vec_in_dim, self.hidden_size)
             self.guidance_in = (
-                MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size) if params.guidance_embed else nn.Identity()
+                MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size) if params.guidance_embed else TensorIdentity
             )
             self.txt_in = nn.Linear(params.context_in_dim, self.hidden_size)
 
@@ -936,24 +942,14 @@ class Util:
     def load_flow_model(name: str, device: str | torch.device = "cuda", hf_download: bool = True):
         # Loading Flux
         print("Init model")
-        ckpt_path = Util.configs[name].ckpt_path
-        if (
-            ckpt_path is None
-            and Util.configs[name].repo_id is not None
-            and Util.configs[name].repo_flow is not None
-            and hf_download
-        ):
-            ckpt_path = hf_hub_download(Util.configs[name].repo_id, Util.configs[name].repo_flow)
 
-        with torch.device("meta" if ckpt_path is not None else device):
-            model = Model.Flux(Util.configs[name].params).cast(dtypes.bfloat16)
+        model = Model.Flux(Util.configs[name].params).cast(dtypes.bfloat16)
 
-        if ckpt_path is not None:
-            print("Loading checkpoint")
-            # load_sft doesn't support torch.device
-            sd = load_sft(ckpt_path, device=str(device))
-            missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
-            Util.print_load_warning(missing, unexpected)
+        state_dict = nn.state.safe_load(fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors"))
+        nn.load_state_dict(model, state_dict)
+
+
+
         return model
 
 
