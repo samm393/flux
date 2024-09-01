@@ -26,7 +26,7 @@ def TensorIdentity(x:Tensor) -> Tensor:
 
 def transfer_model(model, device:str):
     dtype = "int16" if device == "CLANG" else "bfloat16"
-    for param in tqdm(nn.state.get_parameters(model), desc=f"transfering {model} to {device}"):
+    for param in tqdm(nn.state.get_parameters(model), desc=f"transferring {model} to {device}"):
         if param.dtype in (dtypes.int16, dtypes.bfloat16):
             param.replace(param.bitcast(dtype).to(device)).realize()
         else:
@@ -50,7 +50,7 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
     out = pos.unsqueeze(-1) * omega.unsqueeze(0)
 
 
-    out = Tensor.stack([Tensor.cos(out), -Tensor.sin(out), Tensor.sin(out), Tensor.cos(out)], dim=-1)
+    out = Tensor.stack(Tensor.cos(out), -Tensor.sin(out), Tensor.sin(out), Tensor.cos(out), dim=-1)
     out = out.rearrange("b n d (i j) -> b n d i j", i=2, j=2)
     return out.float()
 
@@ -60,7 +60,7 @@ def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tenso
     xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
     xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
     xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
-    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
+    return xq_out.reshape(*xq.shape).cast(xq.dtype), xk_out.reshape(*xk.shape).cast(xk.dtype)
 
 
 ##Layers#############################################################################################################
@@ -75,7 +75,7 @@ class EmbedND():
     def __call__(self, ids: Tensor) -> Tensor:
         n_axes = ids.shape[-1]
         emb = Tensor.cat(
-            [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
+            *[rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
             dim=-3,
         )
 
@@ -100,7 +100,7 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
     args = t[:, None].float() * freqs[None]
     embedding = Tensor.cat(Tensor.cos(args), Tensor.sin(args), dim=-1)
     if dim % 2:
-        embedding = Tensor.cat([embedding, Tensor.zeros_like(embedding[:, :1])], dim=-1)
+        embedding = Tensor.cat(*[embedding, Tensor.zeros_like(embedding[:, :1])], dim=-1)
     if Tensor.is_floating_point(t):
         embedding = embedding.to(t.device)
     return embedding
@@ -124,7 +124,7 @@ class RMSNorm():
     def __call__(self, x: Tensor):
         x_dtype = x.dtype
         x = x.float()
-        rrms = Tensor.rsqrt(Tensor.mean(x**2, dim=-1, keepdim=True) + 1e-6)
+        rrms = Tensor.rsqrt(Tensor.mean(x**2, axis=-1, keepdim=True) + 1e-6)
         return (x * rrms).cast(dtype=x_dtype) * self.scale
 
 
@@ -137,7 +137,7 @@ class QKNorm():
     def __call__(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
         q = self.query_norm(q)
         k = self.key_norm(k)
-        return q.to(v), k.to(v)
+        return q.to(v.device).cast(v.dtype), k.to(v.device).cast(v.dtype)
 
 
 class SelfAttention():
@@ -174,7 +174,7 @@ class Modulation():
         self.lin = nn.Linear(dim, self.multiplier * dim, bias=True)
 
     def __call__(self, vec: Tensor) -> tuple[ModulationOut, ModulationOut | None]:
-        out = self.lin(nn.functional.silu(vec))[:, None, :].chunk(self.multiplier, dim=-1)
+        out = self.lin(vec.silu())[:, None, :].chunk(self.multiplier, dim=-1)
 
         return (
             ModulationOut(*out[:3]),
@@ -214,7 +214,6 @@ class DoubleStreamBlock():
     def __call__(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor) -> tuple[Tensor, Tensor]:
         img_mod1, img_mod2 = self.img_mod(vec)
         txt_mod1, txt_mod2 = self.txt_mod(vec)
-
         # prepare image for attention
         img_modulated = self.img_norm1(img)
         img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
@@ -230,9 +229,9 @@ class DoubleStreamBlock():
         txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
 
         # run actual attention
-        q = Tensor.cat((txt_q, img_q), dim=2)
-        k = Tensor.cat((txt_k, img_k), dim=2)
-        v = Tensor.cat((txt_v, img_v), dim=2)
+        q = Tensor.cat(txt_q, img_q, dim=2)
+        k = Tensor.cat(txt_k, img_k, dim=2)
+        v = Tensor.cat(txt_v, img_v, dim=2)
 
         attn = attention(q, k, v, pe=pe)
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
@@ -291,7 +290,7 @@ class SingleStreamBlock():
         # compute attention
         attn = attention(q, k, v, pe=pe)
         # compute activation in mlp stream, cat again and run second linear layer
-        output = self.linear2(Tensor.cat((attn, self.mlp_act(mlp)), 2))
+        output = self.linear2(Tensor.cat(attn, self.mlp_act(mlp), dim=2))
         return x + mod.gate * output
 
 
@@ -405,8 +404,10 @@ class ClipEmbedder():
         transfer_model(self.encoder, device)
 
     def __call__(self, text):
+
         batch_encoding = Tensor([self.tokenizer.encode(text[0])]) ##TODO: allow batch size > 1
-        return self.encoder.text_model(batch_encoding)
+        ret = self.encoder.text_model(batch_encoding)
+        return ret[:, batch_encoding.argmax(axis=-1)].squeeze(0)
 
 
 
@@ -827,11 +828,10 @@ class Model:
 
             ids = Tensor.cat(txt_ids, img_ids, dim=1)
             pe = self.pe_embedder(ids)
-
             for block in self.double_blocks:
                 img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
-
-            img = Tensor.cat(txt, img, 1)
+            
+            img = Tensor.cat(txt, img, dim=1)
             for block in self.single_blocks:
                 img = block(img, vec=vec, pe=pe)
             img = img[:, txt.shape[1] :, ...]
@@ -1212,11 +1212,10 @@ if __name__ == "__main__":
         )
         opts.seed = None
         if args.offload:
-            ae = ae.to("CLANG")
+            ae.to("CLANG")
             t5.to("NV")
             clip.to("NV")
         inp = Sampling.prepare(t5, clip, x, prompt=opts.prompt)
-        print(inp)
         for k, v in inp.items():
             v.realize()
         timesteps = Sampling.get_schedule(opts.num_steps, inp["img"].shape[1], shift=(args.name != "flux-schnell"))

@@ -14,7 +14,7 @@ from einops import rearrange, repeat
 
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file as load_sft
-from transformers import (CLIPTextModel, CLIPTokenizer, T5EncoderModel)
+from transformers import (CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5Tokenizer)
 
 from torch import Tensor, nn
 
@@ -198,7 +198,6 @@ class DoubleStreamBlock(nn.Module):
     def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor) -> tuple[Tensor, Tensor]:
         img_mod1, img_mod2 = self.img_mod(vec)
         txt_mod1, txt_mod2 = self.txt_mod(vec)
-
         # prepare image for attention
         img_modulated = self.img_norm1(img)
         img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
@@ -324,7 +323,7 @@ class HFEmbedder(nn.Module):
             self.tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(version, max_length=max_length)
             self.hf_module: CLIPTextModel = CLIPTextModel.from_pretrained(version, **hf_kwargs)
         else:
-            self.tokenizer = T5TokenizerMine()
+            self.tokenizer = T5Tokenizer.from_pretrained(version, max_length=max_length)
             self.hf_module: T5EncoderModel = T5EncoderModel.from_pretrained(version, **hf_kwargs)
 
         self.hf_module = self.hf_module.eval().requires_grad_(False)
@@ -768,10 +767,8 @@ class Model:
 
             ids = torch.cat((txt_ids, img_ids), dim=1)
             pe = self.pe_embedder(ids)
-
             for block in self.double_blocks:
                 img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
-
             img = torch.cat((txt, img), 1)
             for block in self.single_blocks:
                 img = block(img, vec=vec, pe=pe)
