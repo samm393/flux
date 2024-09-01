@@ -11,8 +11,13 @@ import math
 from typing import Callable
 
 from tinygrad import Tensor, nn, dtypes
-from tinygrad.nn.state import torch_load
 from tinygrad.helpers import fetch
+
+from extra.models.clip import Tokenizer, Closed
+
+from t5tiny import T5EncoderModel, T5Config
+from sentencepiece import SentencePieceProcessor
+
 
 def TensorIdentity(x:Tensor) -> Tensor:
     return x
@@ -298,11 +303,11 @@ class LastLayer():
 
 
 ##Conditioner########################################################################################################
-from sentencepiece import SentencePieceProcessor
+
 
 class T5TokenizerMine:
     def __init__(self):
-        file_path = fetch("https://huggingface.co/google/t5-v1_1-xxl/resolve/main/spiece.model")
+        file_path = fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/tokenizer_2/spiece.model")
         self.spp = SentencePieceProcessor(str(file_path))
 
     def __call__(self, text, max_length, *args, **kwargs):
@@ -354,8 +359,7 @@ class T5TokenizerMine:
 #         )
 #         return outputs[self.output_key]
 
-from t5tiny import T5EncoderModel
-from t5tiny import T5Config
+
 
 class T5Embedder():
     def __init__(self):
@@ -375,38 +379,27 @@ class T5Embedder():
 
         self.encoder = T5EncoderModel(config)
 
-        # state_dict = nn.state.get_state_dict(self.encoder)
+    def to(self, device:str):
+        dtype = "int16" if device == "CLANG" else "bfloat16"
 
-        # for key in state_dict:
-        #     state_dict[key].replace(state_dict[key].cast("bfloat16").realize())
-        #     print(state_dict[key])
-
-        print('hi')
-        load_state_dict = torch_load(fetch("https://huggingface.co/google/t5-v1_1-xxl/resolve/main/pytorch_model.bin"))
-
-        for key in load_state_dict:
-            load_state_dict[key].replace(load_state_dict[key].to("clang").cast("float16").realize())
-
-        nn.state.load_state_dict(self.encoder, load_state_dict)
+        for param in nn.state.get_parameters(self.encoder):
+            param.replace(param.bitcast(dtype).to(device))
 
     def __call__(self, text:str):
         toks = self.tokenizer(text)
-        return self.encoder(toks)
-
-from extra.models.clip import Tokenizer, Closed
-from tinygrad import Tensor, nn
+        return self.encoder(toks["input_ids"])["last_hidden_states"]
 
 class ClipEmbedder():
     def __init__(self):
         self.tokenizer = Tokenizer.ClipTokenizer()
         self.encoder = Closed.ClipTextModel(None)
-        state_dict = torch_load(fetch("https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/pytorch_model.bin"))
-
-        del state_dict["logit_scale"]
-        del state_dict["text_model.embeddings.position_ids"]
-
-        nn.state.load_state_dict(self.encoder, state_dict)
     
+    def to(self, device:str):
+        dtype = "int16" if device == "CLANG" else "bfloat16"
+
+        for param in nn.state.get_parameters(self.encoder):
+            param.replace(param.bitcast(dtype).to(device))
+
     def __call__(self, text):
         batch_encoding = Tensor([self.tokenizer.encode(text)])
         return self.encoder(batch_encoding)
@@ -720,6 +713,12 @@ class AutoEncoder():
         z = z / self.scale_factor + self.shift_factor
         return self.decoder(z)
 
+    def to(self, device:str):
+        dtype = "int16" if device == "CLANG" else "bfloat16"
+
+        for param in nn.state.get_parameters(self.encoder):
+            param.replace(param.bitcast(dtype).to(device))
+
     def __call__(self, x: Tensor) -> Tensor:
         return self.decode(self.encode(x))
 
@@ -793,6 +792,13 @@ class Model:
             
 
             self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
+
+        def to(self, device:str):
+            dtype = "int16" if device == "CLANG" else "bfloat16"
+
+            for param in nn.state.get_parameters(self.encoder):
+                param.replace(param.bitcast(dtype).to(device))
+
 
         def __call__(
             self,
@@ -948,39 +954,41 @@ class Util:
         state_dict = nn.state.safe_load(fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors"))
         nn.load_state_dict(model, state_dict)
 
-
-
         return model
 
 
     def load_t5(device: str | torch.device = "cuda", max_length: int = 512):
         # max length 64, 128, 256 and 512 should work (if your sequence is short enough)
-        return T5Embedder()
+        t5 = T5Embedder()
+        
+        state_dict_pt_1 = nn.state.safe_load(fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/text_encoder_2/model-00001-of-00002.safetensors"))
+        state_dict_pt_2 = nn.state.safe_load(fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/text_encoder_2/model-00002-of-00002.safetensors"))
+
+        state_dict = state_dict_pt_1 | state_dict_pt_2
+
+        nn.state.load_state_dict(t5.encoder, state_dict)
+
+        return t5
 
 
     def load_clip(device: str | torch.device = "cuda"):
-        return ClipEmbedder()
+        clip = ClipEmbedder()
+        
+        state_dict = nn.state.safe_load(fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/text_encoder/model.safetensors"))
+        del state_dict["logit_scale"]
+        del state_dict["text_model.embeddings.position_ids"]
+
+        nn.state.load_state_dict(clip.encoder, state_dict)
+
+        return clip
 
 
     def load_ae(name: str, device: str | torch.device = "cuda", hf_download: bool = True) -> AutoEncoder:
-        ckpt_path = Util.configs[name].ae_path
-        if (
-            ckpt_path is None
-            and Util.configs[name].repo_id is not None
-            and Util.configs[name].repo_ae is not None
-            and hf_download
-        ):
-            ckpt_path = hf_hub_download(Util.configs[name].repo_id, Util.configs[name].repo_ae)
-
         # Loading the autoencoder
         print("Init AE")
-        with torch.device("meta" if ckpt_path is not None else device):
-            ae = AutoEncoder(Util.configs[name].ae_params)
-
-        if ckpt_path is not None:
-            sd = load_sft(ckpt_path, device=str(device))
-            missing, unexpected = ae.load_state_dict(sd, strict=False, assign=True)
-            Util.print_load_warning(missing, unexpected)
+        ae = AutoEncoder(Util.configs[name].ae_params)
+        state_dict = nn.state.safe_load(fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors"))
+        nn.state.load_state_dict(ae, state_dict)
         return ae
 
 
