@@ -243,7 +243,7 @@ class DoubleStreamBlock():
         # calculate the txt bloks
         txt = txt + txt_mod1.gate * self.txt_attn.proj(txt_attn)
         txt = txt + txt_mod2.gate * ((1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift).sequential(self.txt_mlp)
-        return img, txt
+        return img.realize(), txt.realize()
 
 
 class SingleStreamBlock():
@@ -291,7 +291,7 @@ class SingleStreamBlock():
         attn = attention(q, k, v, pe=pe)
         # compute activation in mlp stream, cat again and run second linear layer
         output = self.linear2(Tensor.cat(attn, self.mlp_act(mlp), dim=2))
-        return x + mod.gate * output
+        return (x + mod.gate * output).realize()
 
 
 class LastLayer():
@@ -454,7 +454,7 @@ class AttnBlock():
         q = q.rearrange("b c h w -> b 1 (h w) c").contiguous()
         k = k.rearrange("b c h w -> b 1 (h w) c").contiguous()
         v = v.rearrange("b c h w -> b 1 (h w) c").contiguous()
-        h_ = nn.functional.scaled_dot_product_attention(q, k, v)
+        h_ = Tensor.scaled_dot_product_attention(q, k, v)
 
         return h_.rearrange("b 1 (h w) c -> b c h w", h=h, w=w, c=c, b=b)
 
@@ -511,7 +511,7 @@ class Upsample():
         self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
 
     def __call__(self, x: Tensor):
-        x = nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
+        x = Tensor.interpolate(x, size=(x.shape[-2]*2, x.shape[-1]*2), mode="nearest")
         x = self.conv(x)
         return x
 
@@ -647,6 +647,9 @@ class Decoder():
         # end
         self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
         self.conv_out = nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
+
+    def to(self, device:str):
+        transfer_model(self, device)
 
     def __call__(self, z: Tensor) -> Tensor:
         # z to block_in
@@ -1227,7 +1230,9 @@ if __name__ == "__main__":
             model.to("NV")
 
         # denoise initial noise
-        x = Sampling.denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance)
+        print(inp)
+        print(timesteps)
+        x = Sampling.denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance).realize()
 
         # offload model, load autoencoder to gpu
         if args.offload:
@@ -1235,9 +1240,9 @@ if __name__ == "__main__":
             ae.decoder.to("NV")
 
         # decode latents to pixel space
-        x = Sampling.unpack(x.float(), opts.height, opts.width)
-        with torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
-            x = ae.decode(x)
+        x = Sampling.unpack(x.float(), opts.height, opts.width).realize()
+        #with torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
+        x = ae.decode(x).realize()
     t1 = time.perf_counter()
 
     fn = output_name.format(idx=idx)
@@ -1246,7 +1251,7 @@ if __name__ == "__main__":
     x = x.clamp(-1, 1)
     x = x[0].rearrange("c h w -> h w c")
 
-    img = Image.fromarray((127.5 * (x + 1.0)).cpu().byte().numpy())
+    img = Image.fromarray((127.5 * (x + 1.0)).cast("uint8").numpy())
     
     img.save(fn, quality=95, subsampling=0)
     idx += 1
