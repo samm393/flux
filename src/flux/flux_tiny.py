@@ -18,9 +18,19 @@ from extra.models.clip import Tokenizer, Closed
 from t5tiny import T5EncoderModel, T5Config
 from sentencepiece import SentencePieceProcessor
 
+from tinygrad.helpers import tqdm
+
 
 def TensorIdentity(x:Tensor) -> Tensor:
     return x
+
+def transfer_model(model, device:str):
+    dtype = "int16" if device == "CLANG" else "bfloat16"
+    for param in tqdm(nn.state.get_parameters(model), desc=f"transfering {model} to {device}"):
+        if param.dtype in (dtypes.int16, dtypes.bfloat16):
+            param.replace(param.bitcast(dtype).to(device)).realize()
+        else:
+            param.replace(param.to(device)).realize()
 
 ##math###############################################################################################################
 def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
@@ -83,16 +93,16 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
     """
     t = time_factor * t
     half = dim // 2
-    freqs = Tensor.exp(-math.log(max_period) * Tensor.arange(start=0, end=half, dtype=dtypes.float32) / half).to(
+    freqs = Tensor.exp(-math.log(max_period) * Tensor.arange(0, stop=half, dtype=dtypes.float32) / half).to(
         t.device
     )
 
     args = t[:, None].float() * freqs[None]
-    embedding = Tensor.cat([Tensor.cos(args), Tensor.sin(args)], dim=-1)
+    embedding = Tensor.cat(Tensor.cos(args), Tensor.sin(args), dim=-1)
     if dim % 2:
         embedding = Tensor.cat([embedding, Tensor.zeros_like(embedding[:, :1])], dim=-1)
     if Tensor.is_floating_point(t):
-        embedding = embedding.to(t)
+        embedding = embedding.to(t.device)
     return embedding
 
 
@@ -314,7 +324,7 @@ class T5TokenizerMine:
         if isinstance(text, str):
             text = [text]
         encoded = self.spp.Encode(text)
-        ret = Tensor.zeros((len(encoded), max_length), dtype=dtypes.int)
+        ret = Tensor.zeros((len(encoded), max_length), dtype=dtypes.int).contiguous()
         for i, row in enumerate(encoded):
             ret[i, :len(row) + 1] = Tensor(row + [1])
         return {"input_ids":ret}
@@ -380,13 +390,10 @@ class T5Embedder():
         self.encoder = T5EncoderModel(config)
 
     def to(self, device:str):
-        dtype = "int16" if device == "CLANG" else "bfloat16"
-
-        for param in nn.state.get_parameters(self.encoder):
-            param.replace(param.bitcast(dtype).to(device))
+        transfer_model(self.encoder, device)
 
     def __call__(self, text:str):
-        toks = self.tokenizer(text)
+        toks = self.tokenizer(text, 256)
         return self.encoder(toks["input_ids"])["last_hidden_states"]
 
 class ClipEmbedder():
@@ -395,14 +402,11 @@ class ClipEmbedder():
         self.encoder = Closed.ClipTextModel(None)
     
     def to(self, device:str):
-        dtype = "int16" if device == "CLANG" else "bfloat16"
-
-        for param in nn.state.get_parameters(self.encoder):
-            param.replace(param.bitcast(dtype).to(device))
+        transfer_model(self.encoder, device)
 
     def __call__(self, text):
-        batch_encoding = Tensor([self.tokenizer.encode(text)])
-        return self.encoder(batch_encoding)
+        batch_encoding = Tensor([self.tokenizer.encode(text[0])]) ##TODO: allow batch size > 1
+        return self.encoder.text_model(batch_encoding)
 
 
 
@@ -510,6 +514,10 @@ class Upsample():
         x = self.conv(x)
         return x
 
+class named_module:
+    def __init__(self):
+        pass
+
 
 class Encoder():
     def __init__(
@@ -543,7 +551,7 @@ class Encoder():
             for _ in range(self.num_res_blocks):
                 block.append(ResnetBlock(in_channels=block_in, out_channels=block_out))
                 block_in = block_out
-            down = nn.Module()
+            down = named_module()
             down.block = block
             down.attn = attn
             if i_level != self.num_resolutions - 1:
@@ -552,7 +560,7 @@ class Encoder():
             self.down.append(down)
 
         # middle
-        self.mid = nn.Module()
+        self.mid = named_module()
         self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in)
         self.mid.attn_1 = AttnBlock(block_in)
         self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in)
@@ -613,7 +621,7 @@ class Decoder():
         self.conv_in = nn.Conv2d(z_channels, block_in, kernel_size=3, stride=1, padding=1)
 
         # middle
-        self.mid = nn.Module()
+        self.mid = named_module()
         self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in)
         self.mid.attn_1 = AttnBlock(block_in)
         self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in)
@@ -627,7 +635,7 @@ class Decoder():
             for _ in range(self.num_res_blocks + 1):
                 block.append(ResnetBlock(in_channels=block_in, out_channels=block_out))
                 block_in = block_out
-            up = nn.Module()
+            up = named_module()
             up.block = block
             up.attn = attn
             if i_level != 0:
@@ -714,10 +722,7 @@ class AutoEncoder():
         return self.decoder(z)
 
     def to(self, device:str):
-        dtype = "int16" if device == "CLANG" else "bfloat16"
-
-        for param in nn.state.get_parameters(self.encoder):
-            param.replace(param.bitcast(dtype).to(device))
+        transfer_model(self, device)
 
     def __call__(self, x: Tensor) -> Tensor:
         return self.decode(self.encode(x))
@@ -794,10 +799,7 @@ class Model:
             self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
 
         def to(self, device:str):
-            dtype = "int16" if device == "CLANG" else "bfloat16"
-
-            for param in nn.state.get_parameters(self.encoder):
-                param.replace(param.bitcast(dtype).to(device))
+            transfer_model(self, device)
 
 
         def __call__(
@@ -823,13 +825,13 @@ class Model:
             vec = vec + self.vector_in(y)
             txt = self.txt_in(txt)
 
-            ids = Tensor.cat((txt_ids, img_ids), dim=1)
+            ids = Tensor.cat(txt_ids, img_ids, dim=1)
             pe = self.pe_embedder(ids)
 
             for block in self.double_blocks:
                 img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
 
-            img = Tensor.cat((txt, img), 1)
+            img = Tensor.cat(txt, img, 1)
             for block in self.single_blocks:
                 img = block(img, vec=vec, pe=pe)
             img = img[:, txt.shape[1] :, ...]
@@ -949,10 +951,10 @@ class Util:
         # Loading Flux
         print("Init model")
 
-        model = Model.Flux(Util.configs[name].params).cast(dtypes.bfloat16)
+        model = Model.Flux(Util.configs[name].params)
 
         state_dict = nn.state.safe_load(fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors"))
-        nn.load_state_dict(model, state_dict)
+        nn.state.load_state_dict(model, state_dict)
 
         return model
 
@@ -966,7 +968,7 @@ class Util:
 
         state_dict = state_dict_pt_1 | state_dict_pt_2
 
-        nn.state.load_state_dict(t5.encoder, state_dict)
+        nn.state.load_state_dict(t5.encoder, state_dict, strict=False)
 
         return t5
 
@@ -975,8 +977,6 @@ class Util:
         clip = ClipEmbedder()
         
         state_dict = nn.state.safe_load(fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/text_encoder/model.safetensors"))
-        del state_dict["logit_scale"]
-        del state_dict["text_model.embeddings.position_ids"]
 
         nn.state.load_state_dict(clip.encoder, state_dict)
 
@@ -988,6 +988,7 @@ class Util:
         print("Init AE")
         ae = AutoEncoder(Util.configs[name].ae_params)
         state_dict = nn.state.safe_load(fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors"))
+        # for key in state_dict: print(key)
         nn.state.load_state_dict(ae, state_dict)
         return ae
 
@@ -1003,7 +1004,7 @@ class Sampling:
         dtype: torch.dtype,
         seed: int,
     ):
-        return torch.randn(
+        return Tensor.randn(
             num_samples,
             16,
             # allow for packing
@@ -1011,7 +1012,7 @@ class Sampling:
             2 * math.ceil(width / 16),
             device=device,
             dtype=dtype,
-            generator=torch.Generator(device=device).manual_seed(seed),
+            #generator=torch.Generator(device=device).manual_seed(seed),
         )
 
 
@@ -1025,7 +1026,7 @@ class Sampling:
             ##img = repeat(img, "1 ... -> bs ...", bs=bs) ## not supported
             img = img.expand((bs, *img.shape[1:]))
 
-        img_ids = Tensor.zeros(h // 2, w // 2, 3)
+        img_ids = Tensor.zeros(h // 2, w // 2, 3).contiguous()
         img_ids[..., 1] = img_ids[..., 1] + Tensor.arange(h // 2)[:, None]
         img_ids[..., 2] = img_ids[..., 2] + Tensor.arange(w // 2)[None, :]
         ##img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs) ##not supported
@@ -1074,7 +1075,9 @@ class Sampling:
         shift: bool = True,
     ) -> list[float]:
         # extra step for zero
-        timesteps = Tensor.linspace(1, 0, num_steps + 1)
+        #timesteps = Tensor.linspace(1, 0, num_steps + 1)
+        step_size = -1.0 / num_steps  # calculate the step size
+        timesteps = Tensor.arange(1, 0 + step_size, step_size)
 
         # shifting the schedule to favor high timesteps for higher signal images
         if shift:
@@ -1145,7 +1148,7 @@ if __name__ == "__main__":
     parser.add_argument('--height',     type=int,       default=512,            help="height of the sample in pixels (should be a multiple of 16)")
     parser.add_argument('--seed',       type=int,       default=None,           help="Set a seed for sampling")
     parser.add_argument('--prompt',     type=str,       default=default_prompt, help="Prompt used for sampling")
-    parser.add_argument('--device',     type=str,       default="cuda" if torch.cuda.is_available() else "cpu", help="Pytorch device")
+    parser.add_argument('--device',     type=str,       default="NV",           help="Pytorch device")
     parser.add_argument('--num_steps',  type=int,       default=None,           help="number of sampling steps (default 4 for schnell, 50 for guidance distilled)")
     parser.add_argument('--guidance',   type=float,     default=3.5,            help="guidance value used for guidance distillation")
     parser.add_argument('--offload',    type=bool,      default=False,          help="offload to cpu")
@@ -1177,9 +1180,10 @@ if __name__ == "__main__":
 
     with Tensor.test():
         # init all components
+        model = Util.load_flow_model(args.name, device="cpu" if args.offload else torch_device)
+        model.to("CLANG")
         t5 = Util.load_t5(torch_device, max_length=256 if args.name == "flux-schnell" else 512)
         clip = Util.load_clip(torch_device)
-        model = Util.load_flow_model(args.name, device="cpu" if args.offload else torch_device)
         ae = Util.load_ae(args.name, device="cpu" if args.offload else torch_device)
 
         rng = torch.Generator(device="cpu")
@@ -1208,26 +1212,28 @@ if __name__ == "__main__":
         )
         opts.seed = None
         if args.offload:
-            ae = ae.cpu()
-            torch.cuda.empty_cache()
-            t5, clip = t5.to(torch_device), clip.to(torch_device)
+            ae = ae.to("CLANG")
+            t5.to("NV")
+            clip.to("NV")
         inp = Sampling.prepare(t5, clip, x, prompt=opts.prompt)
+        print(inp)
+        for k, v in inp.items():
+            v.realize()
         timesteps = Sampling.get_schedule(opts.num_steps, inp["img"].shape[1], shift=(args.name != "flux-schnell"))
 
         # offload TEs to CPU, load model to gpu
         if args.offload:
-            t5, clip = t5.cpu(), clip.cpu()
-            torch.cuda.empty_cache()
-            model = model.to(torch_device)
+            t5.to("CLANG")
+            clip.to("CLANG")
+            model.to("NV")
 
         # denoise initial noise
         x = Sampling.denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance)
 
         # offload model, load autoencoder to gpu
         if args.offload:
-            model.cpu()
-            torch.cuda.empty_cache()
-            ae.decoder.to(x.device)
+            model.to("CLANG")
+            ae.decoder.to("NV")
 
         # decode latents to pixel space
         x = Sampling.unpack(x.float(), opts.height, opts.width)
